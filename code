@@ -1,0 +1,82 @@
+SELECT user_sample,
+tp_gmv/alt_2_fraud_gmv::float as tp_GMV_rate,
+fp_gmv/alt_2_fraud_gmv::float as fp_GMV_rate,
+fn_gmv/alt_2_secure_gmv::float as fn_GMV_rate,
+tn_gmv/alt_2_secure_gmv::float as tn_GMV_rate
+
+FROM
+(
+ SELECT count(distinct user_id) user_sample, 
+  sum (alt_target_2 * user_gmv) alt_2_fraud_gmv, 
+  sum ((1-alt_target_2) * user_gmv) alt_2_secure_gmv,
+  sum (alt_target_2 * target * user_gmv) as tp_gmv,
+  sum (alt_target_2 *(1-target) * user_gmv) as fp_gmv,
+  sum ((1-alt_target_2) * target * user_gmv) as fn_gmv,
+  sum ((1-alt_target_2) *(1-target)* user_gmv ) as tn_gmv  
+ 
+FROM 
+ (
+SELECT user_id, user_gmv, 
+   case  
+     when first_disputed_utx_date is not null then 1                                                -- CHB 
+     when first_disputed_utx_date is null and
+          first_utx_date<current_date-interval'60 day' and
+         (first_utx_date < first_decline_date or first_decline_date is null) then 0                 -- no CHB / never declined / if declined, first utx 60 days ago 
+     when tagging_reason = 'blocked_kyc_refusal' then 1                                             -- KYC refusal
+     when tagging_reason = 'blocked_kyc_not_accepted' then  1                                       -- KYC rejected
+     when first_disputed_utx_date is null  and buyer_kyc =1 then 0                                  -- no chb, submitted KYC 
+     when tagging_reason in ('lfs_mode', 'lfs_stale_period_by_block') then 1                        -- non-manual LFS mode
+     when first_decline_date = first_utx_date and target= 0 then 0.7                                -- declined on first utx: clear rate 
+     when first_decline_date = first_utx_date and target= 1 then 1                                  -- declined on first utx: fraud 
+else 0
+   end alt_target_2,
+    target
+    
+  FROM (
+   SELECT rmr.user_id as user_id, sum(net_gmv) user_gmv, min(utx_date) as first_utx_date, 
+     min(case
+          when probability_1>[model_threshold] then utx_date else null
+         end) first_decline_date,
+     min(case
+          when tr.tagging_reason = 'chargeback' and is_excluded is null 
+          then vd.txs_date else null
+         end) first_disputed_utx_date,    
+        tr.suspect as target, kyc.buyer_kyc buyer_kyc, st.tagging_reason tagging_reason, ops.first_cleared_utx
+    FROM table_risk_model_results rmr
+    JOIN table_risk_model_tagging_reason tr ON tr.user_id = rmr.user_id
+    JOIN cb_transactions t ON t.value_id = rmr.utx_id
+    LEFT JOIN (SELECT invoice_number, txs_date
+               FROM view_disputes vd 
+               GROUP BY invoice_number, txs_date) vd ON t.value_order_number = vd.invoice_number 
+    LEFT JOIN view_business_buyers bb ON bb.zeek_user_id = rmr.user_id                                                  -- excluding BB
+    JOIN cb_users_expansions exp ON tr.user_id = exp.value_original_id
+    LEFT JOIN (SELECT cb_users_expansions_id manual_lfs FROM cb_users_expansions_value_manual_lfs_mode_dates
+               GROUP BY cb_users_expansions_id ) mm ON mm.manual_lfs = exp.id                                           -- excluding manual LFS mode
+    LEFT JOIN (SELECT value_user_id user_id, count(t.value_id) utx_count, min(case when t.value_late_fraud_suspect_clear_date is not null then t.value_date end) first_cleared_utx
+               FROM cb_transactions t
+               JOIN cb_users u ON u.id = t.value_user_id
+               WHERE t.value_status!= 'processor_declined'
+               AND value_first_kyc_date is null 
+               GROUP BY value_user_id ) ops ON ops.user_id = rmr.user_id                                                   -- OPS clear date
+    LEFT JOIN (SELECT user_id, tagging_reason 
+               FROM (
+                 SELECT tr.user_id as user_id, tagging_reason
+                 FROM table_risk_model_tagging_reason tr 
+                 WHERE tagging_reason IN ('blocked_kyc_refusal','blocked_kyc_not_accepted','lfs_mode', 'lfs_stale_period_by_block')
+                 GROUP BY tr.user_id, tr.tagging_reason)                                                                  -- tagging 
+               ) st ON st.user_id = rmr.user_id
+    LEFT JOIN (SELECT user_id, buyer_kyc 
+               FROM (
+                 SELECT value_id user_id, case when value_first_kyc_date is not null then 1 else 0 end buyer_kyc
+                 FROM cb_users)
+                 WHERE buyer_kyc = 1) kyc ON kyc.user_id = rmr.user_id                                                        -- ever had buyer KYC
+               
+      WHERE [version=risk_model_version]
+       AND t.value_status!= 'processor_declined'
+       AND bb.zeek_user_id is null  
+       AND mm.manual_lfs is null
+       AND (rmr.utx_date < ops.first_cleared_utx OR ops.first_cleared_utx is null OR kyc.buyer_kyc = 1)
+      GROUP BY rmr.user_id, tr.suspect, kyc.buyer_kyc, st.tagging_reason, ops.first_cleared_utx
+    ) 
+  )
+ )
